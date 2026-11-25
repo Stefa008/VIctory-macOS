@@ -9967,6 +9967,14 @@ impl<'a> Lower<'a> {
             (true, false) => ("storeVertexOutput", 171),
             (true, true) => ("storePrimitiveOutput", 172),
         };
+        // Every value first, then the stores, an element's channels side by
+        // side. Metal's DXIL converter (behind D3DMetal) makes one vector
+        // write of an element's channel stores, where the first of them is:
+        // a channel converted between two stores would be used there before
+        // it exists, which the converter does not notice and the Apple GPU
+        // compiler crashes on (found by Ahmet-Dedeler, Marvisak/VIctory#1128).
+        // Compilers emit an element's stores together; hosts expect that.
+        let mut ready = Vec::with_capacity(stores.len());
         for (id, col, value, half) in stores {
             let mut x = self.i32_of(value)?;
             if let Some(high) = half {
@@ -9995,15 +10003,19 @@ impl<'a> Lower<'a> {
                 }
                 _ => (".i32", x),
             };
+            ready.push((id, col, suffix, x));
+        }
+        let thread = (mesh && !ready.is_empty()).then(|| self.mesh_thread());
+        // Stable: two stores of one channel keep their order.
+        ready.sort_by_key(|&(id, col, ..)| (id, col));
+        for (id, col, suffix, x) in ready {
             let mut args = vec![
                 self.s.m.i32(id as u32),
                 self.s.m.i32(0),
                 self.s.m.i8(col),
                 x,
             ];
-            if mesh {
-                args.push(self.mesh_thread());
-            }
+            args.extend(thread);
             let void = self.s.t.void;
             self.s.op(
                 self.cur,

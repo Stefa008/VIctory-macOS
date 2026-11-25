@@ -1227,6 +1227,193 @@ mod tests {
         emit(&c, &native, &p, &st, &io, &res)
     }
 
+    /// [`triangle_mesh`] exporting one 16-bit `TEXCOORD` of four channels,
+    /// one per dword's low half: the corner's x and y bits (0 or 1, 0 or 2)
+    /// converted to f16 there, then f16 0.5 and 4.0.
+    fn half_output_mesh() -> Result<HostShader, ShaderError> {
+        let words = [
+            0xD765_0001u32, // v_mbcnt_lo_u32_b32 v1, -1, 0
+            0x0001_00C1,
+            0x3604_0281, // v_and_b32 v2, 1, v1
+            0x3606_0282, // v_and_b32 v3, 2, v1
+            0x7E04_0D02, // v_cvt_f32_u32 v2, v2
+            0x7E06_0D03, // v_cvt_f32_u32 v3, v3
+            0x1008_04F6, // v_mul_f32 v4, 4.0, v2
+            0x0608_08F3, // v_add_f32 v4, -1.0, v4
+            0x100A_06F4, // v_mul_f32 v5, 2.0, v3
+            0x060A_0AF3, // v_add_f32 v5, -1.0, v5
+            0x7E0C_02F0, // v_mov_b32 v6, 0.5
+            0x7E0E_02F2, // v_mov_b32 v7, 1.0
+            0x7E14_1502, // v_cvt_f16_f32 v10, v2
+            0x7E16_1503, // v_cvt_f16_f32 v11, v3
+            0x7E18_02FF, // v_mov_b32 v12, f16 0.5
+            0x3800,
+            0x7E1A_02FF, // v_mov_b32 v13, f16 4.0
+            0x4400,
+            0x7E12_02FF, // v_mov_b32 v9, TRIANGLE
+            TRIANGLE,
+            0xF800_020F, // exp param0 v10, v11, v12, v13
+            0x0D0C_0B0A,
+            0xF800_0941, // exp prim v9, off, off, off done
+            0x0000_0009,
+            0xF800_08CF, // exp pos0 v4, v5, v6, v7 done
+            0x0706_0504,
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: false,
+            vgprs: 16,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(crate::native::MeshIo {
+                outputs: vec![crate::native::VsOutput {
+                    usage: crate::native::Usage::Generic,
+                    row: 1,
+                    param: 0,
+                    fp16: true,
+                    pack2: false,
+                }],
+                clip_cntl: 0,
+                threads: 32,
+                max_vertices: 32,
+                max_primitives: 32,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let element = |name: &str, kind: u8, row: u32, half: bool| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(row),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half,
+        };
+        let osg = [
+            element("SV_Position", 3, 0, false),
+            element("TEXCOORD", 0, 1, true),
+        ];
+        let osg1 = container::signature(&osg, false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes)?;
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+        let st = structure::structure(&p)?;
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native)?;
+        emit(&c, &native, &p, &st, &io, &res)
+    }
+
+    /// A mesh program's 16-bit output reaches the pixel shader, converted,
+    /// on the host GPU and on WARP (where they have mesh shaders), with its
+    /// channels converted before any of their stores.
+    #[test]
+    #[cfg(windows)]
+    fn half_mesh_outputs_reach_the_pixel_shader() {
+        use super::host::{Draw, Host, Root};
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_FEATURE_D3D12_OPTIONS7, D3D12_FEATURE_DATA_D3D12_OPTIONS7,
+            D3D12_MESH_SHADER_TIER_NOT_SUPPORTED, D3D12_SHADER_VISIBILITY_MESH,
+        };
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // The pixel shader: TEXCOORD0 as the color.
+        let mut s = Shader::new(true);
+        s.inputs.push(SigElement {
+            name: "TEXCOORD".into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(1),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        });
+        s.outputs.push(SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        });
+        let b = s.entry;
+        for c in 0..4u8 {
+            let args = [s.m.i32(0), s.m.i32(0), s.m.i8(c), s.m.undef(s.t.i32)];
+            let v = s.op(b, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args);
+            let args = [s.m.i32(0), s.m.i32(0), s.m.i8(c), v];
+            s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
+        }
+        s.m.terminate(b, super::bitcode::Term::Ret);
+        let ps = s.finish();
+        let ms = half_output_mesh().unwrap();
+        let mut ran = 0;
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+            // SAFETY: the query writes the structure of the given size.
+            let queried = unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS7,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            };
+            if queried.is_err() || options.MeshShaderTier == D3D12_MESH_SHADER_TIER_NOT_SUPPORTED {
+                eprintln!("no mesh shaders on the {label} device; skipped");
+                continue;
+            }
+            let root = host
+                .root_signature_for(&[(&ms, D3D12_SHADER_VISIBILITY_MESH)])
+                .unwrap();
+            let pso = host
+                .mesh_pipeline_with(&root, &ms.dxil, &ps)
+                .unwrap_or_else(|e| panic!("{label}: mesh pipeline: {e}"));
+            let texels = host
+                .draw(
+                    &root,
+                    &pso,
+                    &Draw {
+                        roots: vec![(0, Root::Constants(vec![0]))],
+                        textures: &[],
+                        samplers: &[],
+                        vertices: &[],
+                        stride: 0,
+                        size: (16, 16),
+                        mesh_groups: 1,
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: draw: {e}"));
+            // x and y interpolate between the corners; z and w are constant.
+            let right = |t: &[f32; 4]| {
+                (0.0..=1.0).contains(&t[0]) && (0.0..=2.0).contains(&t[1]) && t[2..] == [0.5, 4.0]
+            };
+            let wrong = texels.iter().filter(|t| !right(t)).count();
+            assert_eq!(
+                wrong, 0,
+                "{label}: {wrong} of 256 texels wrong, first {:?}",
+                texels[0]
+            );
+            ran += 1;
+        }
+        eprintln!("16-bit mesh outputs drew on {ran} device(s)");
+    }
+
     /// A primitive export's corners are 9-bit indices: the edge flag above
     /// each (bits 9, 19, 29) is no part of it. Masking ten bits made a
     /// flagged corner index 512 or more, past any mesh program's vertices
