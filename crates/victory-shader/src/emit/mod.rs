@@ -398,78 +398,61 @@ pub struct Options {
 pub const METAL_MESH_OUTPUT_BYTES: u32 = 32768;
 
 /// A translated mesh shader's declared outputs per thread group: the counts
-/// it declares (the console program's maxima) and the signature rows of a
-/// vertex and of a primitive.
+/// it declares (the console program's maxima) and the signature components
+/// of a vertex and of a primitive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MeshOutputs {
     pub vertices: u32,
     pub primitives: u32,
-    pub vertex_rows: u32,
-    pub primitive_rows: u32,
+    pub vertex_components: u32,
+    pub primitive_components: u32,
 }
 
 impl MeshOutputs {
-    /// The outputs' size as Metal counts it: 16 bytes per row of each
-    /// declared vertex and primitive (indices are not counted). Measured on
-    /// an M4 with D3DMetal 4.0 beta 3: with full rows the largest shape
-    /// that draws is exactly [`METAL_MESH_OUTPUT_BYTES`].
+    /// The outputs' size as Metal counts it: 4 bytes per declared component
+    /// of each declared vertex and primitive (indices are not counted), not
+    /// 16 per signature row. Measured on an M4 with D3DMetal 4.0 beta 3: the
+    /// largest shape that draws is exactly [`METAL_MESH_OUTPUT_BYTES`], and
+    /// at 128 vertices 17 rows of 59 components draw, 17 of 65 do not.
     pub fn bytes(&self) -> u32 {
-        16 * (self.vertex_rows * self.vertices + self.primitive_rows * self.primitives)
+        4 * (self.vertex_components * self.vertices + self.primitive_components * self.primitives)
     }
 }
 
-/// The declared outputs of a translated mesh shader, from its `PSV0` part;
-/// None for other stages or a container without one.
+/// The declared outputs of a translated mesh shader: the counts from its
+/// `PSV0` part, the components from its `OSG1` and `PSG1`. None for other
+/// stages or a container without them.
 pub fn mesh_outputs(dxil: &[u8]) -> Option<MeshOutputs> {
+    use crate::dxbc::u32_at;
     let c = Container::parse(dxil).ok()?;
     let psv = c.part(FourCC::PSV0)?.data;
     // The runtime info follows its size; mesh fields up to byte 33.
-    let size = crate::dxbc::u32_at(psv, 0).ok()? as usize;
+    let size = u32_at(psv, 0).ok()? as usize;
     let info = psv.get(4..4 + size).filter(|i| i.len() >= 33)?;
     // Shader kind 13: mesh.
     if info[24] != 13 {
         return None;
     }
     let half = |at: usize| u32::from(u16::from_le_bytes([info[at], info[at + 1]]));
+    // The components of a signature's elements that have a register.
+    let components = |fourcc| -> Option<u32> {
+        let Some(part) = c.part(fourcc) else {
+            return Some(0);
+        };
+        let (count, base) = (u32_at(part.data, 0).ok()?, u32_at(part.data, 4).ok()?);
+        (0..count as usize).try_fold(0, |sum, i| {
+            let at = base as usize + 32 * i;
+            let register = u32_at(part.data, at + 20).ok()?;
+            let mask = *part.data.get(at + 24)?;
+            let counted = (register != u32::MAX).then(|| mask.count_ones());
+            Some(sum + counted.unwrap_or(0))
+        })
+    };
     Some(MeshOutputs {
         vertices: half(12),
         primitives: half(14),
-        vertex_rows: u32::from(info[32]),
-        primitive_rows: u32::from(info[26]),
-    })
-}
-
-/// The per-vertex output rows of a console container's `OSG1`, as the
-/// console declares them.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ConsoleRows {
-    /// Rows holding at least one element.
-    pub rows: u32,
-    /// Rows holding only 16-bit elements, which the translation declares
-    /// 32-bit: Metal counts each as a full 16-byte row.
-    pub half_rows: u32,
-    /// Components of all elements.
-    pub components: u32,
-}
-
-/// The vertex output rows of a console shader container; None when it has
-/// no readable `OSG1`.
-pub fn console_vertex_rows(container: &[u8]) -> Option<ConsoleRows> {
-    let c = Container::parse(container).ok()?;
-    let elements = signature(c.part(FourCC::OSG1)?.data).ok()?;
-    let mut rows = std::collections::BTreeMap::<u32, bool>::new();
-    let mut components = 0;
-    for e in &elements {
-        components += u32::from(e.cols);
-        if let Some(r) = e.row {
-            let all_half = rows.entry(r).or_insert(true);
-            *all_half &= e.half;
-        }
-    }
-    Some(ConsoleRows {
-        rows: rows.len() as u32,
-        half_rows: rows.values().filter(|&&h| h).count() as u32,
-        components,
+        vertex_components: components(FourCC::OSG1)?,
+        primitive_components: components(FourCC::PSG1)?,
     })
 }
 
@@ -1424,6 +1407,18 @@ mod tests {
         vertex_rows: u32,
         primitive_rows: u32,
     ) -> Result<HostShader, ShaderError> {
+        let rows = vec![&[4u8][..]; vertex_rows.saturating_sub(1) as usize];
+        shaped_mesh(vertices, primitives, &rows, primitive_rows)
+    }
+
+    /// [`sized_mesh`] with the vertex rows after the position given: each
+    /// the widths of its `TEXCOORD` elements, side by side.
+    fn shaped_mesh(
+        vertices: u32,
+        primitives: u32,
+        vertex_rows: &[&[u8]],
+        primitive_rows: u32,
+    ) -> Result<HostShader, ShaderError> {
         let mut words: Vec<u32> = vec![
             0xD765_0001, // v_mbcnt_lo_u32_b32 v1, -1, 0
             0x0001_00C1,
@@ -1440,25 +1435,25 @@ mod tests {
             0x7E12_02FF, // v_mov_b32 v9, TRIANGLE
             TRIANGLE,
         ];
-        let row = |name: &str, kind: u8, index: u32, row: u32| SigElement {
+        let element = |name: &str, kind: u8, index: u32, row: u32, col: u8, cols: u8| SigElement {
             name: name.into(),
             index,
             kind,
             comp: 9,
             interp: 0,
             row: Some(row),
-            col: 0,
-            cols: 4,
-            usage: 0xF,
+            col,
+            cols,
+            usage: (1 << cols) - 1,
             half: false,
         };
-        let mut osg = vec![row("SV_Position", 3, 0, 0)];
+        let mut osg = vec![element("SV_Position", 3, 0, 0, 0, 4)];
         let mut psg = Vec::new();
         let mut outputs = Vec::new();
         let mut param = 0u32;
-        let mut export = |words: &mut Vec<u32>, row: u32, primitive: bool| {
-            // exp param<n> v4, v5, v6, v7
-            words.extend([0xF800_000F | (32 + param) << 4, 0x0706_0504]);
+        let mut export = |words: &mut Vec<u32>, row: u32, mask: u32, primitive: bool| {
+            // exp param<n> v4, v5, v6, v7 (the channels of `mask`)
+            words.extend([0xF800_0000 | mask | (32 + param) << 4, 0x0706_0504]);
             outputs.push(crate::native::VsOutput {
                 usage: crate::native::Usage::Generic,
                 row: row as u8,
@@ -1468,13 +1463,18 @@ mod tests {
             });
             param += 1;
         };
-        for n in 1..vertex_rows {
-            export(&mut words, n, false);
-            osg.push(row("TEXCOORD", 0, n - 1, n));
+        let mut index = 0;
+        for (row, widths) in (1..).zip(vertex_rows) {
+            let mut col = 0;
+            for &cols in *widths {
+                osg.push(element("TEXCOORD", 0, index, row, col, cols));
+                (index, col) = (index + 1, col + cols);
+            }
+            export(&mut words, row, (1 << col) - 1, false);
         }
         for n in 0..primitive_rows {
-            export(&mut words, n, true);
-            psg.push(row("PRIMDATA", 0, n, n));
+            export(&mut words, n, 0xF, true);
+            psg.push(element("PRIMDATA", 0, n, n, 0, 4));
         }
         words.extend([
             0xF800_0941, // exp prim v9, off, off, off done
@@ -1511,10 +1511,33 @@ mod tests {
         emit(&c, &native, &p, &st, &io, &res)
     }
 
+    /// Rows of 4 + 4 + 4 + 4 + 4, 3 and 1, 2, 3 and 1, then 3 seven times
+    /// and a last 4: 17 rows of 59 components (the position's with them),
+    /// a shape Metal draws at 128 vertices though its rows are 34816 bytes.
+    const HALF_FILLED: [&[u8]; 16] = [
+        &[4],
+        &[4],
+        &[4],
+        &[4],
+        &[4],
+        &[3, 1],
+        &[2],
+        &[3, 1],
+        &[3],
+        &[3],
+        &[3],
+        &[3],
+        &[3],
+        &[3],
+        &[3],
+        &[4],
+    ];
+
     /// A translated mesh shader's declared outputs come back from its
-    /// `PSV0`, and their size is Metal's count: 16 bytes per row of each
-    /// declared vertex and primitive. 17 rows of 128 vertices is the
-    /// 34816 bytes of #132. Other stages have none.
+    /// `PSV0` and signatures, and their size is Metal's count: 4 bytes per
+    /// component of each declared vertex and primitive. 17 full rows of
+    /// 128 vertices are 34816 bytes; 17 rows of 59 components are under
+    /// the limit. Other stages have none.
     #[test]
     fn mesh_outputs_are_counted_as_metal_counts_them() {
         for (v, p, vr, pr, bytes) in [
@@ -1531,62 +1554,25 @@ mod tests {
                 MeshOutputs {
                     vertices: v,
                     primitives: p,
-                    vertex_rows: vr,
-                    primitive_rows: pr,
+                    vertex_components: 4 * vr,
+                    primitive_components: 4 * pr,
                 }
             );
             assert_eq!(o.bytes(), bytes, "{o:?}");
         }
+        let ms = shaped_mesh(128, 128, &HALF_FILLED, 0).unwrap();
+        let o = mesh_outputs(&ms.dxil).unwrap();
+        assert_eq!((o.vertex_components, o.bytes()), (59, 30208), "{o:?}");
         assert_eq!(mesh_outputs(&[]), None);
         #[cfg(windows)]
         assert_eq!(mesh_outputs(&constant_color()), None);
     }
 
-    /// The console's vertex rows: rows of only 16-bit elements are counted
-    /// apart (a row shared with a 32-bit element is not one of them).
-    #[test]
-    fn console_vertex_rows_count_rows_of_only_16_bit_elements() {
-        let e = |name: &str, kind: u8, index: u32, row: u32, col: u8, cols: u8| SigElement {
-            name: name.into(),
-            index,
-            kind,
-            comp: 9,
-            interp: 0,
-            row: Some(row),
-            col,
-            cols,
-            usage: (1 << cols) - 1,
-            half: false,
-        };
-        let elements = [
-            e("SV_Position", 3, 0, 0, 0, 4),
-            e("TEXCOORD", 0, 0, 1, 0, 4),
-            e("TEXCOORD", 0, 1, 2, 0, 2),
-            e("TEXCOORD", 0, 2, 2, 2, 2),
-            e("TEXCOORD", 0, 3, 3, 0, 1),
-        ];
-        let mut osg1 = container::signature(&elements, false);
-        // 16-bit floats (component type 6): rows 1 and 3 whole, row 2 half.
-        for i in [1, 2, 4] {
-            let at = 8 + 32 * i + 16;
-            osg1[at..at + 4].copy_from_slice(&6u32.to_le_bytes());
-        }
-        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
-        assert_eq!(
-            console_vertex_rows(&bytes),
-            Some(ConsoleRows {
-                rows: 4,
-                half_rows: 2,
-                components: 13,
-            })
-        );
-        assert_eq!(console_vertex_rows(&[]), None);
-    }
-
     /// Mesh shaders whose outputs fill Metal's limit exactly still draw on
-    /// the hardware device (one row more, D3DMetal marks the pipeline a
-    /// no-op and nothing is drawn: reported, not asserted, as other hosts
-    /// may allow it).
+    /// the hardware device, as do rows only partly filled whose components
+    /// fit (one row or component more, D3DMetal marks the pipeline a no-op
+    /// and nothing is drawn: reported, not asserted, as other hosts may
+    /// allow it).
     #[test]
     #[cfg(windows)]
     fn mesh_shaders_at_metals_output_limit_draw() {
@@ -1616,8 +1602,8 @@ mod tests {
             return;
         }
         let ps = constant_color();
-        let draws = |v, p, vr, pr| -> Result<bool, String> {
-            let ms = sized_mesh(v, p, vr, pr).map_err(|e| e.to_string())?;
+        let shaped = |v, p, rows: &[&[u8]], pr| -> Result<bool, String> {
+            let ms = shaped_mesh(v, p, rows, pr).map_err(|e| e.to_string())?;
             let root = host.root_signature_for(&[(&ms, D3D12_SHADER_VISIBILITY_MESH)])?;
             let pso = host.mesh_pipeline_with(&root, &ms.dxil, &ps)?;
             let texels = host.draw(
@@ -1635,6 +1621,18 @@ mod tests {
             )?;
             Ok(texels.iter().all(|t| *t == [1.0, 0.5, 0.25, 1.0]))
         };
+        let draws = |v, p, vr: u32, pr| shaped(v, p, &vec![&[4u8][..]; vr as usize - 1], pr);
+        // 17 rows of 59 components: whole rows would be over the limit.
+        assert_eq!(
+            shaped(128, 128, &HALF_FILLED, 0),
+            Ok(true),
+            "17 rows of 59 components"
+        );
+        let one_more: Vec<&[u8]> = [&[&[4u8][..]; 15][..], &[&[1]]].concat();
+        eprintln!(
+            "128 vertices, 17 rows of 65 components: drawn {:?}",
+            shaped(128, 128, &one_more, 0)
+        );
         for (v, p, vr, pr) in [
             (128, 128, 16, 0),
             (128, 128, 15, 1),
