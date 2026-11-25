@@ -439,6 +439,40 @@ pub fn mesh_outputs(dxil: &[u8]) -> Option<MeshOutputs> {
     })
 }
 
+/// The per-vertex output rows of a console container's `OSG1`, as the
+/// console declares them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConsoleRows {
+    /// Rows holding at least one element.
+    pub rows: u32,
+    /// Rows holding only 16-bit elements, which the translation declares
+    /// 32-bit: Metal counts each as a full 16-byte row.
+    pub half_rows: u32,
+    /// Components of all elements.
+    pub components: u32,
+}
+
+/// The vertex output rows of a console shader container; None when it has
+/// no readable `OSG1`.
+pub fn console_vertex_rows(container: &[u8]) -> Option<ConsoleRows> {
+    let c = Container::parse(container).ok()?;
+    let elements = signature(c.part(FourCC::OSG1)?.data).ok()?;
+    let mut rows = std::collections::BTreeMap::<u32, bool>::new();
+    let mut components = 0;
+    for e in &elements {
+        components += u32::from(e.cols);
+        if let Some(r) = e.row {
+            let all_half = rows.entry(r).or_insert(true);
+            *all_half &= e.half;
+        }
+    }
+    Some(ConsoleRows {
+        rows: rows.len() as u32,
+        half_rows: rows.values().filter(|&&h| h).count() as u32,
+        components,
+    })
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container, without write marks.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
@@ -1506,6 +1540,47 @@ mod tests {
         assert_eq!(mesh_outputs(&[]), None);
         #[cfg(windows)]
         assert_eq!(mesh_outputs(&constant_color()), None);
+    }
+
+    /// The console's vertex rows: rows of only 16-bit elements are counted
+    /// apart (a row shared with a 32-bit element is not one of them).
+    #[test]
+    fn console_vertex_rows_count_rows_of_only_16_bit_elements() {
+        let e = |name: &str, kind: u8, index: u32, row: u32, col: u8, cols: u8| SigElement {
+            name: name.into(),
+            index,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(row),
+            col,
+            cols,
+            usage: (1 << cols) - 1,
+            half: false,
+        };
+        let elements = [
+            e("SV_Position", 3, 0, 0, 0, 4),
+            e("TEXCOORD", 0, 0, 1, 0, 4),
+            e("TEXCOORD", 0, 1, 2, 0, 2),
+            e("TEXCOORD", 0, 2, 2, 2, 2),
+            e("TEXCOORD", 0, 3, 3, 0, 1),
+        ];
+        let mut osg1 = container::signature(&elements, false);
+        // 16-bit floats (component type 6): rows 1 and 3 whole, row 2 half.
+        for i in [1, 2, 4] {
+            let at = 8 + 32 * i + 16;
+            osg1[at..at + 4].copy_from_slice(&6u32.to_le_bytes());
+        }
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+        assert_eq!(
+            console_vertex_rows(&bytes),
+            Some(ConsoleRows {
+                rows: 4,
+                half_rows: 2,
+                components: 13,
+            })
+        );
+        assert_eq!(console_vertex_rows(&[]), None);
     }
 
     /// Mesh shaders whose outputs fill Metal's limit exactly still draw on
