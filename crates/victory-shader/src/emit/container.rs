@@ -90,12 +90,22 @@ pub(crate) fn same_mode_per_row(elements: &mut [SigElement], read: bool) {
 
 /// Packs the arbitrary elements (semantic kind 0) into as few rows as hold
 /// them, first fit from the widest, a row holding one interpolation mode.
-/// System values keep their rows, which nothing else shares.
+/// Clip and cull distances keep the rows they share, moved into the first
+/// rows left free: one at the end would hold the count (#132). Other system
+/// values keep their rows, which nothing else shares.
 pub(crate) fn pack_rows(elements: &mut [SigElement]) {
-    let reserved: std::collections::BTreeSet<u32> = elements
+    use std::collections::BTreeSet;
+    let distance = |e: &SigElement| matches!(e.kind, 6 | 7);
+    let reserved: BTreeSet<u32> = elements
         .iter()
-        .filter(|e| e.kind != 0)
+        .filter(|e| e.kind != 0 && !distance(e))
         .filter_map(|e| e.row)
+        .collect();
+    let distance_rows: BTreeSet<u32> = elements
+        .iter()
+        .filter(|e| distance(e))
+        .filter_map(|e| e.row)
+        .filter(|r| !reserved.contains(r))
         .collect();
     let mut order: Vec<usize> = (0..elements.len())
         .filter(|&i| elements[i].kind == 0 && elements[i].row.is_some())
@@ -129,6 +139,18 @@ pub(crate) fn pack_rows(elements: &mut [SigElement]) {
         };
         elements[i].row = Some(r as u32);
         elements[i].col = col;
+    }
+    let mut free = (0u32..).filter(|&r| {
+        !reserved.contains(&r) && rows.get(r as usize).is_none_or(|&(taken, _)| taken == 0)
+    });
+    for old in distance_rows {
+        let Some(new) = free.next() else { break };
+        for e in elements
+            .iter_mut()
+            .filter(|e| distance(e) && e.row == Some(old))
+        {
+            e.row = Some(new);
+        }
     }
 }
 
@@ -502,6 +524,54 @@ fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A clip distance in the console's last row moves into the first row
+    /// the packed elements leave free: left there it would hold the count
+    /// (#132). Other system values keep their rows to themselves.
+    #[test]
+    fn packing_moves_clip_distances_and_keeps_other_system_values() {
+        let element = |name: &str, kind: u8, interp: u8, row: u32, cols: u8| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp,
+            row: Some(row),
+            col: 0,
+            cols,
+            usage: 0,
+            half: false,
+        };
+        let mut els = vec![
+            element("SV_Position", 3, 4, 0, 4),
+            element("SV_ViewportArrayIndex", 5, 1, 3, 1),
+        ];
+        // 15 half rows around them, the clip distance in the last.
+        for n in (1..17).filter(|&r| r != 3) {
+            els.push(SigElement {
+                index: n,
+                ..element("TEXCOORD", 0, 2, n, 2)
+            });
+        }
+        els.push(element("SV_ClipDistance", 6, 2, 17, 2));
+        pack_rows(&mut els);
+        let row = |name: &str| els.iter().find(|e| e.name == name).unwrap().row.unwrap();
+        assert_eq!((row("SV_Position"), row("SV_ViewportArrayIndex")), (0, 3));
+        // 15 two-wide elements take 8 rows (1, 2, 4..=9), the distance the next.
+        assert_eq!(row("SV_ClipDistance"), 10);
+        let mut taken = std::collections::BTreeSet::new();
+        for e in &els {
+            assert!(e.col + e.cols <= 4, "{e:?}");
+            for c in e.col..e.col + e.cols {
+                assert!(taken.insert((e.row.unwrap(), c)), "{e:?} overlaps");
+            }
+        }
+        for r in [0, 3, 10] {
+            let shared = els.iter().filter(|e| e.row == Some(r)).count();
+            assert_eq!(shared, 1, "row {r} shared");
+        }
+        assert_eq!(els.iter().filter_map(|e| e.row).max(), Some(10));
+    }
 
     #[test]
     fn md5_core_matches_the_standard() {

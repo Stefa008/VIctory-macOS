@@ -473,6 +473,30 @@ pub fn console_vertex_rows(container: &[u8]) -> Option<ConsoleRows> {
     })
 }
 
+/// The vertex outputs of a container's `OSG1`, by row: each element as
+/// `row.col+cols/kind` and its type (`f`, `i`, `u`, `h` for 16-bit), what
+/// decides how tightly a mesh shader's outputs pack (#132). None without a
+/// readable `OSG1`.
+pub fn output_layout(container: &[u8]) -> Option<String> {
+    let c = Container::parse(container).ok()?;
+    let mut elements = signature(c.part(FourCC::OSG1)?.data).ok()?;
+    elements.sort_by_key(|e| (e.row, e.col));
+    let layout: Vec<String> = elements
+        .iter()
+        .filter_map(|e| {
+            let ty = match (e.half, e.comp) {
+                (true, _) => 'h',
+                (_, 9) => 'f',
+                (_, 4) => 'i',
+                (_, 5) => 'u',
+                _ => '?',
+            };
+            Some(format!("{}.{}+{}/{}{ty}", e.row?, e.col, e.cols, e.kind))
+        })
+        .collect();
+    Some(layout.join(" "))
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container, without write marks.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
@@ -1581,6 +1605,7 @@ mod tests {
             })
         );
         assert_eq!(console_vertex_rows(&[]), None);
+        assert_eq!(output_layout(&[]), None);
     }
 
     /// Mesh shaders whose outputs fill Metal's limit exactly still draw on

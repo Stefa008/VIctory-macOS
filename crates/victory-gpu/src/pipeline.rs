@@ -122,7 +122,7 @@ impl Shader {
             .get_or_init(|| {
                 let (started, cpu) = (std::time::Instant::now(), thread_cpu());
                 use victory_shader::emit::{
-                    METAL_MESH_OUTPUT_BYTES, console_vertex_rows, mesh_outputs,
+                    METAL_MESH_OUTPUT_BYTES, console_vertex_rows, mesh_outputs, output_layout,
                 };
                 // A mesh shader over Metal's limit (#132), with the console's
                 // vertex rows, read before the container goes.
@@ -133,9 +133,12 @@ impl Shader {
                         .0
                         .as_ref()
                         .ok()
-                        .and_then(|t| mesh_outputs(&t.host.dxil))
-                        .filter(|o| o.bytes() > METAL_MESH_OUTPUT_BYTES)
-                        .map(|o| (o, console_vertex_rows(&container)));
+                        .and_then(|t| Some((mesh_outputs(&t.host.dxil)?, &t.host.dxil)))
+                        .filter(|(o, _)| o.bytes() > METAL_MESH_OUTPUT_BYTES)
+                        .map(|(o, dxil)| {
+                            let layouts = (output_layout(&container), output_layout(dxil));
+                            (o, console_vertex_rows(&container), layouts)
+                        });
                     // After the translation, not before: if it panics, the
                     // bytes are still there for the next try.
                     *container = Vec::new();
@@ -158,8 +161,11 @@ impl Shader {
                         );
                         // D3DMetal makes such a pipeline and marks it a no-op:
                         // its draws are dropped without an error (#132).
-                        if let Some((o, rows)) = over.filter(|_| crate::shader_cache::under_wine()) {
+                        if let Some((o, rows, (console, packed))) =
+                            over.filter(|_| crate::shader_cache::under_wine())
+                        {
                             let rows = rows.unwrap_or_default();
+                            let none = || String::from("?");
                             tracing::warn!(
                                 hash = %self.hash,
                                 bytes = o.bytes(),
@@ -171,6 +177,8 @@ impl Shader {
                                 console_rows = rows.rows,
                                 console_16bit_rows = rows.half_rows,
                                 console_components = rows.components,
+                                console_layout = %console.unwrap_or_else(none),
+                                layout = %packed.unwrap_or_else(none),
                                 "mesh shader outputs exceed Metal's limit; its draws are likely dropped"
                             );
                         }
