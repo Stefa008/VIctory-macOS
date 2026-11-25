@@ -798,6 +798,23 @@ impl Shader {
             self.m.named_md("dx.resources", vec![r]);
         }
 
+        // A mesh shader over Metal's output limit (#132): Metal counts every
+        // row of a vertex whole, D3D12 the components, so the console's
+        // half-filled rows can be a row or more too many. Its arbitrary
+        // vertex outputs are packed into as few rows as hold them; stores
+        // name an element and a column within it, and the pixel stage
+        // links by semantic, so only the signatures change.
+        if let Some(mesh) = self.mesh {
+            container::same_mode_per_row(&mut self.outputs, false);
+            let rows =
+                |els: &[SigElement]| els.iter().filter_map(|e| e.row).max().map_or(0, |r| r + 1);
+            let bytes = 16
+                * (rows(&self.outputs) * mesh.max_vertices
+                    + rows(&self.prims) * mesh.max_primitives);
+            if bytes > super::METAL_MESH_OUTPUT_BYTES {
+                container::pack_rows(&mut self.outputs);
+            }
+        }
         let graphics = self.threads.is_none() || self.mesh.is_some();
         if graphics {
             // shortcut: every output is declared to depend on every input; the

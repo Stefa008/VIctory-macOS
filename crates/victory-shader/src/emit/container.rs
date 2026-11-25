@@ -88,6 +88,50 @@ pub(crate) fn same_mode_per_row(elements: &mut [SigElement], read: bool) {
     }
 }
 
+/// Packs the arbitrary elements (semantic kind 0) into as few rows as hold
+/// them, first fit from the widest, a row holding one interpolation mode.
+/// System values keep their rows, which nothing else shares.
+pub(crate) fn pack_rows(elements: &mut [SigElement]) {
+    let reserved: std::collections::BTreeSet<u32> = elements
+        .iter()
+        .filter(|e| e.kind != 0)
+        .filter_map(|e| e.row)
+        .collect();
+    let mut order: Vec<usize> = (0..elements.len())
+        .filter(|&i| elements[i].kind == 0 && elements[i].row.is_some())
+        .collect();
+    order.sort_by_key(|&i| {
+        (
+            std::cmp::Reverse(elements[i].cols),
+            elements[i].row,
+            elements[i].col,
+        )
+    });
+    // Per row: the columns taken and the interpolation mode.
+    let mut rows: Vec<(u8, u8)> = Vec::new();
+    for i in order {
+        let (cols, interp) = (elements[i].cols.clamp(1, 4), elements[i].interp);
+        let span = (1u8 << cols) - 1;
+        let mut r = 0usize;
+        let col = loop {
+            if rows.len() <= r {
+                rows.push((0, interp));
+            }
+            let (taken, mode) = rows[r];
+            if !reserved.contains(&(r as u32))
+                && (taken == 0 || mode == interp)
+                && let Some(c) = (0..=4 - cols).find(|&c| taken & span << c == 0)
+            {
+                rows[r] = (taken | span << c, interp);
+                break c;
+            }
+            r += 1;
+        };
+        elements[i].row = Some(r as u32);
+        elements[i].col = col;
+    }
+}
+
 pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend((elements.len() as u32).to_le_bytes());

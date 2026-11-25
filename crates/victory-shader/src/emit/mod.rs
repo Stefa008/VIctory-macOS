@@ -1654,6 +1654,218 @@ mod tests {
         }
     }
 
+    /// A triangle mesh program declaring `vertices` vertices and
+    /// primitives whose 16 `TEXCOORD` outputs each fill half a row
+    /// (`.xy`), one per row after the position: 17 rows, half of them
+    /// empty. Every `TEXCOORD` is (0.5, 1.0) but the last, (2.0, 0.5).
+    fn half_filled_mesh(vertices: u32) -> Result<HostShader, ShaderError> {
+        let mut words: Vec<u32> = vec![
+            0xD765_0001, // v_mbcnt_lo_u32_b32 v1, -1, 0
+            0x0001_00C1,
+            0x3604_0281, // v_and_b32 v2, 1, v1
+            0x3606_0282, // v_and_b32 v3, 2, v1
+            0x7E04_0D02, // v_cvt_f32_u32 v2, v2
+            0x7E06_0D03, // v_cvt_f32_u32 v3, v3
+            0x1008_04F6, // v_mul_f32 v4, 4.0, v2
+            0x0608_08F3, // v_add_f32 v4, -1.0, v4
+            0x100A_06F4, // v_mul_f32 v5, 2.0, v3
+            0x060A_0AF3, // v_add_f32 v5, -1.0, v5
+            0x7E0C_02F0, // v_mov_b32 v6, 0.5
+            0x7E0E_02F2, // v_mov_b32 v7, 1.0
+            0x7E10_02F4, // v_mov_b32 v8, 2.0
+            0x7E12_02FF, // v_mov_b32 v9, TRIANGLE
+            TRIANGLE,
+        ];
+        let element = |name: &str, kind: u8, index: u32, row: u32, cols: u8| SigElement {
+            name: name.into(),
+            index,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(row),
+            col: 0,
+            cols,
+            usage: 0xF >> (4 - cols),
+            half: false,
+        };
+        let mut osg = vec![element("SV_Position", 3, 0, 0, 4)];
+        let mut outputs = Vec::new();
+        for n in 0..16u32 {
+            // exp param<n> .xy: v6, v7 (the last: v8, v6)
+            let src = if n == 15 { 0x0706_0608 } else { 0x0706_0706 };
+            words.extend([0xF800_0003 | (32 + n) << 4, src]);
+            outputs.push(crate::native::VsOutput {
+                usage: crate::native::Usage::Generic,
+                row: (n + 1) as u8,
+                param: n as u8,
+                fp16: false,
+                pack2: false,
+            });
+            osg.push(element("TEXCOORD", 0, n, n + 1, 2));
+        }
+        words.extend([
+            0xF800_0941, // exp prim v9, off, off, off done
+            0x0000_0009,
+            0xF800_08CF, // exp pos0 v4, v5, v6, v7 done
+            0x0706_0504,
+            0xBF81_0000, // s_endpgm
+        ]);
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: false,
+            vgprs: 10,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(crate::native::MeshIo {
+                outputs,
+                clip_cntl: 0,
+                threads: 32,
+                max_vertices: vertices,
+                max_primitives: vertices,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let osg1 = container::signature(&osg, false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes)?;
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+        let st = structure::structure(&p)?;
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native)?;
+        emit(&c, &native, &p, &st, &io, &res)
+    }
+
+    /// A mesh shader over Metal's output limit has its half-filled rows
+    /// packed: 17 rows at 128 vertices (34816 bytes, #132) become the
+    /// position's and 8 shared ones, each `TEXCOORD` whole in its row and
+    /// none overlapping. Under the limit the console's rows stay.
+    #[test]
+    fn mesh_outputs_over_metals_limit_are_packed_into_fewer_rows() {
+        let packed = half_filled_mesh(128).unwrap();
+        let o = mesh_outputs(&packed.dxil).unwrap();
+        assert_eq!((o.vertex_rows, o.bytes()), (9, 16 * 9 * 128), "{o:?}");
+        let c = Container::parse(&packed.dxil).unwrap();
+        let els = signature(c.part(FourCC::OSG1).unwrap().data).unwrap();
+        let mut taken = std::collections::BTreeSet::new();
+        for e in &els {
+            let row = e.row.unwrap();
+            assert!(e.col + e.cols <= 4, "{e:?}");
+            if e.kind == 3 {
+                assert_eq!(row, 0, "the position keeps its row");
+            } else {
+                assert_ne!(row, 0, "{e:?} shares the position's row");
+            }
+            for c in e.col..e.col + e.cols {
+                assert!(taken.insert((row, c)), "{e:?} overlaps");
+            }
+        }
+        let kept = half_filled_mesh(32).unwrap();
+        assert_eq!(mesh_outputs(&kept.dxil).unwrap().vertex_rows, 17);
+    }
+
+    /// The packed mesh shader draws on the hardware device, and a pixel
+    /// shader reading the last `TEXCOORD` where the console put it (row 16,
+    /// `.xy`) gets its value: the stages link by semantic.
+    #[test]
+    #[cfg(windows)]
+    fn packed_mesh_outputs_reach_the_pixel_shader() {
+        use super::host::{Draw, Host, Root};
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_FEATURE_D3D12_OPTIONS7, D3D12_FEATURE_DATA_D3D12_OPTIONS7,
+            D3D12_MESH_SHADER_TIER_NOT_SUPPORTED, D3D12_SHADER_VISIBILITY_MESH,
+        };
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Ok(host) = Host::new(false) else {
+            eprintln!("no SM 6.6 hardware device; skipped");
+            return;
+        };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+        // SAFETY: the query writes the structure of the given size.
+        let queried = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS7,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        };
+        if queried.is_err() || options.MeshShaderTier == D3D12_MESH_SHADER_TIER_NOT_SUPPORTED {
+            eprintln!("no mesh shaders on the hardware device; skipped");
+            return;
+        }
+        // The pixel shader: TEXCOORD15.xy at row 16, then 0 and 1.
+        let mut s = Shader::new(true);
+        s.inputs.push(SigElement {
+            name: "TEXCOORD".into(),
+            index: 15,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(16),
+            col: 0,
+            cols: 2,
+            usage: 3,
+            half: false,
+        });
+        s.outputs.push(SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        });
+        let b = s.entry;
+        for c in 0..4u8 {
+            let v = if c < 2 {
+                let args = [s.m.i32(0), s.m.i32(0), s.m.i8(c), s.m.undef(s.t.i32)];
+                s.op(b, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args)
+            } else {
+                s.m.f32(if c == 2 { 0.0f32 } else { 1.0 }.to_bits())
+            };
+            let args = [s.m.i32(0), s.m.i32(0), s.m.i8(c), v];
+            s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
+        }
+        s.m.terminate(b, super::bitcode::Term::Ret);
+        let ps = s.finish();
+        let ms = half_filled_mesh(128).unwrap();
+        let root = host
+            .root_signature_for(&[(&ms, D3D12_SHADER_VISIBILITY_MESH)])
+            .unwrap();
+        let pso = host.mesh_pipeline_with(&root, &ms.dxil, &ps).unwrap();
+        let texels = host
+            .draw(
+                &root,
+                &pso,
+                &Draw {
+                    roots: vec![(0, Root::Constants(vec![0]))],
+                    textures: &[],
+                    samplers: &[],
+                    vertices: &[],
+                    stride: 0,
+                    size: (16, 16),
+                    mesh_groups: 1,
+                },
+            )
+            .unwrap();
+        let wrong = texels
+            .iter()
+            .filter(|t| **t != [2.0, 0.5, 0.0, 1.0])
+            .count();
+        assert_eq!(
+            wrong, 0,
+            "{wrong} of 256 texels wrong, first {:?}",
+            texels[0]
+        );
+    }
+
     /// A pixel shader interpolating at sample positions (PERSP_SAMPLE
     /// barycentrics, `SPI_PS_INPUT_ADDR` bit 0) runs at sample frequency:
     /// DXC's PSV0 says so in PSInfo.SampleFrequency (runtime info byte 1)
