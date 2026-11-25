@@ -392,6 +392,53 @@ pub struct Options {
     pub bias_as_gradients: bool,
 }
 
+/// Metal's limit on a mesh shader's outputs per thread group, in bytes
+/// (#132): D3DMetal makes such a pipeline, then marks it a no-op, so its
+/// draws are dropped without an error.
+pub const METAL_MESH_OUTPUT_BYTES: u32 = 32768;
+
+/// A translated mesh shader's declared outputs per thread group: the counts
+/// it declares (the console program's maxima) and the signature rows of a
+/// vertex and of a primitive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeshOutputs {
+    pub vertices: u32,
+    pub primitives: u32,
+    pub vertex_rows: u32,
+    pub primitive_rows: u32,
+}
+
+impl MeshOutputs {
+    /// The outputs' size as Metal counts it: 16 bytes per row of each
+    /// declared vertex and primitive (indices are not counted). Measured on
+    /// an M4 with D3DMetal 4.0 beta 3: with full rows the largest shape
+    /// that draws is exactly [`METAL_MESH_OUTPUT_BYTES`].
+    pub fn bytes(&self) -> u32 {
+        16 * (self.vertex_rows * self.vertices + self.primitive_rows * self.primitives)
+    }
+}
+
+/// The declared outputs of a translated mesh shader, from its `PSV0` part;
+/// None for other stages or a container without one.
+pub fn mesh_outputs(dxil: &[u8]) -> Option<MeshOutputs> {
+    let c = Container::parse(dxil).ok()?;
+    let psv = c.part(FourCC::PSV0)?.data;
+    // The runtime info follows its size; mesh fields up to byte 33.
+    let size = crate::dxbc::u32_at(psv, 0).ok()? as usize;
+    let info = psv.get(4..4 + size).filter(|i| i.len() >= 33)?;
+    // Shader kind 13: mesh.
+    if info[24] != 13 {
+        return None;
+    }
+    let half = |at: usize| u32::from(u16::from_le_bytes([info[at], info[at + 1]]));
+    Some(MeshOutputs {
+        vertices: half(12),
+        primitives: half(14),
+        vertex_rows: u32::from(info[32]),
+        primitive_rows: u32::from(info[26]),
+    })
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container, without write marks.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
@@ -1330,6 +1377,205 @@ mod tests {
         }
         if ran == 0 {
             eprintln!("no device with mesh shaders; skipped");
+        }
+    }
+
+    /// The triangle mesh program of [`triangle_mesh`] declaring `vertices`
+    /// and `primitives`, with `vertex_rows` rows per vertex (the position,
+    /// then full `TEXCOORD` rows) and `primitive_rows` full rows per
+    /// primitive.
+    fn sized_mesh(
+        vertices: u32,
+        primitives: u32,
+        vertex_rows: u32,
+        primitive_rows: u32,
+    ) -> Result<HostShader, ShaderError> {
+        let mut words: Vec<u32> = vec![
+            0xD765_0001, // v_mbcnt_lo_u32_b32 v1, -1, 0
+            0x0001_00C1,
+            0x3604_0281, // v_and_b32 v2, 1, v1
+            0x3606_0282, // v_and_b32 v3, 2, v1
+            0x7E04_0D02, // v_cvt_f32_u32 v2, v2
+            0x7E06_0D03, // v_cvt_f32_u32 v3, v3
+            0x1008_04F6, // v_mul_f32 v4, 4.0, v2
+            0x0608_08F3, // v_add_f32 v4, -1.0, v4
+            0x100A_06F4, // v_mul_f32 v5, 2.0, v3
+            0x060A_0AF3, // v_add_f32 v5, -1.0, v5
+            0x7E0C_02F0, // v_mov_b32 v6, 0.5
+            0x7E0E_02F2, // v_mov_b32 v7, 1.0
+            0x7E12_02FF, // v_mov_b32 v9, TRIANGLE
+            TRIANGLE,
+        ];
+        let row = |name: &str, kind: u8, index: u32, row: u32| SigElement {
+            name: name.into(),
+            index,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(row),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        };
+        let mut osg = vec![row("SV_Position", 3, 0, 0)];
+        let mut psg = Vec::new();
+        let mut outputs = Vec::new();
+        let mut param = 0u32;
+        let mut export = |words: &mut Vec<u32>, row: u32, primitive: bool| {
+            // exp param<n> v4, v5, v6, v7
+            words.extend([0xF800_000F | (32 + param) << 4, 0x0706_0504]);
+            outputs.push(crate::native::VsOutput {
+                usage: crate::native::Usage::Generic,
+                row: row as u8,
+                param: param as u8 | if primitive { 0x80 } else { 0 },
+                fp16: false,
+                pack2: false,
+            });
+            param += 1;
+        };
+        for n in 1..vertex_rows {
+            export(&mut words, n, false);
+            osg.push(row("TEXCOORD", 0, n - 1, n));
+        }
+        for n in 0..primitive_rows {
+            export(&mut words, n, true);
+            psg.push(row("PRIMDATA", 0, n, n));
+        }
+        words.extend([
+            0xF800_0941, // exp prim v9, off, off, off done
+            0x0000_0009,
+            0xF800_08CF, // exp pos0 v4, v5, v6, v7 done
+            0x0706_0504,
+            0xBF81_0000, // s_endpgm
+        ]);
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: false,
+            vgprs: 10,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(crate::native::MeshIo {
+                outputs,
+                clip_cntl: 0,
+                threads: 32,
+                max_vertices: vertices,
+                max_primitives: primitives,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let osg1 = container::signature(&osg, false);
+        let psg1 = container::signature(&psg, false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1), (FourCC::PSG1, &psg1)]);
+        let c = Container::parse(&bytes)?;
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+        let st = structure::structure(&p)?;
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native)?;
+        emit(&c, &native, &p, &st, &io, &res)
+    }
+
+    /// A translated mesh shader's declared outputs come back from its
+    /// `PSV0`, and their size is Metal's count: 16 bytes per row of each
+    /// declared vertex and primitive. 17 rows of 128 vertices is the
+    /// 34816 bytes of #132. Other stages have none.
+    #[test]
+    fn mesh_outputs_are_counted_as_metal_counts_them() {
+        for (v, p, vr, pr, bytes) in [
+            (32, 32, 1, 0, 512),
+            (128, 128, 16, 0, METAL_MESH_OUTPUT_BYTES),
+            (128, 128, 17, 0, 34816),
+            (128, 64, 16, 1, 33792),
+            (64, 128, 24, 4, METAL_MESH_OUTPUT_BYTES),
+        ] {
+            let ms = sized_mesh(v, p, vr, pr).unwrap_or_else(|e| panic!("{v} {p} {vr} {pr}: {e}"));
+            let o = mesh_outputs(&ms.dxil).expect("a mesh shader's outputs");
+            assert_eq!(
+                o,
+                MeshOutputs {
+                    vertices: v,
+                    primitives: p,
+                    vertex_rows: vr,
+                    primitive_rows: pr,
+                }
+            );
+            assert_eq!(o.bytes(), bytes, "{o:?}");
+        }
+        assert_eq!(mesh_outputs(&[]), None);
+        #[cfg(windows)]
+        assert_eq!(mesh_outputs(&constant_color()), None);
+    }
+
+    /// Mesh shaders whose outputs fill Metal's limit exactly still draw on
+    /// the hardware device (one row more, D3DMetal marks the pipeline a
+    /// no-op and nothing is drawn: reported, not asserted, as other hosts
+    /// may allow it).
+    #[test]
+    #[cfg(windows)]
+    fn mesh_shaders_at_metals_output_limit_draw() {
+        use super::host::{Draw, Host, Root};
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_FEATURE_D3D12_OPTIONS7, D3D12_FEATURE_DATA_D3D12_OPTIONS7,
+            D3D12_MESH_SHADER_TIER_NOT_SUPPORTED, D3D12_SHADER_VISIBILITY_MESH,
+        };
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Ok(host) = Host::new(false) else {
+            eprintln!("no SM 6.6 hardware device; skipped");
+            return;
+        };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+        // SAFETY: the query writes the structure of the given size.
+        let queried = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS7,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        };
+        if queried.is_err() || options.MeshShaderTier == D3D12_MESH_SHADER_TIER_NOT_SUPPORTED {
+            eprintln!("no mesh shaders on the hardware device; skipped");
+            return;
+        }
+        let ps = constant_color();
+        let draws = |v, p, vr, pr| -> Result<bool, String> {
+            let ms = sized_mesh(v, p, vr, pr).map_err(|e| e.to_string())?;
+            let root = host.root_signature_for(&[(&ms, D3D12_SHADER_VISIBILITY_MESH)])?;
+            let pso = host.mesh_pipeline_with(&root, &ms.dxil, &ps)?;
+            let texels = host.draw(
+                &root,
+                &pso,
+                &Draw {
+                    roots: vec![(0, Root::Constants(vec![0]))],
+                    textures: &[],
+                    samplers: &[],
+                    vertices: &[],
+                    stride: 0,
+                    size: (16, 16),
+                    mesh_groups: 1,
+                },
+            )?;
+            Ok(texels.iter().all(|t| *t == [1.0, 0.5, 0.25, 1.0]))
+        };
+        for (v, p, vr, pr) in [
+            (128, 128, 16, 0),
+            (128, 128, 15, 1),
+            (256, 128, 8, 0),
+            (64, 128, 24, 4),
+        ] {
+            assert_eq!(
+                draws(v, p, vr, pr),
+                Ok(true),
+                "{v} vertices, {p} primitives, rows {vr} + {pr}"
+            );
+            eprintln!(
+                "{v} vertices, {p} primitives, rows {} + {pr}: drawn {:?}",
+                vr + 1,
+                draws(v, p, vr + 1, pr)
+            );
         }
     }
 
