@@ -257,31 +257,64 @@ pub unsafe fn matches(base: usize, size: usize, site: &Site) -> Patched {
 /// The image stays mapped and no thread runs its code yet.
 #[cfg(windows)]
 pub unsafe fn write(base: usize, size: usize, site: &Site, code: &[u8]) -> Patched {
+    // SAFETY: the caller's promise.
+    unsafe { write_together(base, size, &[(site, code)]) }
+}
+
+/// Writes each code over its site, all of them or none: every site's bytes
+/// are compared and every range made writable before any is copied, so a
+/// mismatch or a refusal at one site leaves the others as they were too.
+///
+/// # Safety
+/// The image stays mapped and no thread runs its code yet.
+#[cfg(windows)]
+pub unsafe fn write_together(base: usize, size: usize, parts: &[(&Site, &[u8])]) -> Patched {
     use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
     use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    if code.len() > site.bytes.len() {
-        return Patched::Failed("replacement longer than the bytes compared");
-    }
-    // SAFETY: the caller's promise.
-    let found = unsafe { matches(base, size, site) };
-    if found != Patched::Done {
-        return found;
-    }
-    let at = base + site.at;
-    let mut old = 0;
-    // SAFETY: inside the image (checked); made writable for this and put
-    // back; nothing runs it yet.
-    unsafe {
-        if VirtualProtect(at as *const _, code.len(), PAGE_EXECUTE_READWRITE, &mut old) == 0 {
-            return Patched::Failed("Windows would not make it writable");
+    for (site, code) in parts {
+        if code.len() > site.bytes.len() {
+            return Patched::Failed("replacement longer than the bytes compared");
         }
-        std::ptr::copy_nonoverlapping(code.as_ptr(), at as *mut u8, code.len());
-        VirtualProtect(at as *const _, code.len(), old, &mut old);
-        FlushInstructionCache(GetCurrentProcess(), at as *const _, code.len());
+        // SAFETY: the caller's promise.
+        let found = unsafe { matches(base, size, site) };
+        if found != Patched::Done {
+            return found;
+        }
+    }
+    // (address, length, protection before)
+    let mut opened: Vec<(usize, usize, u32)> = Vec::with_capacity(parts.len());
+    // SAFETY: inside the image (checked); made writable for this and put
+    // back, the last opened first (two sites may share a page); nothing
+    // runs it yet.
+    unsafe {
+        for (site, code) in parts {
+            let at = base + site.at;
+            let mut old = 0;
+            if VirtualProtect(at as *const _, code.len(), PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+                for &(at, len, old) in opened.iter().rev() {
+                    let mut was = 0;
+                    VirtualProtect(at as *const _, len, old, &mut was);
+                }
+                return Patched::Failed("Windows would not make it writable");
+            }
+            opened.push((at, code.len(), old));
+        }
+        for (site, code) in parts {
+            std::ptr::copy_nonoverlapping(code.as_ptr(), (base + site.at) as *mut u8, code.len());
+        }
+        for &(at, len, old) in opened.iter().rev() {
+            let mut was = 0;
+            VirtualProtect(at as *const _, len, old, &mut was);
+            FlushInstructionCache(GetCurrentProcess(), at as *const _, len);
+        }
     }
     Patched::Done
 }
+
+/// Sites written together, each with its replacement.
+#[cfg(windows)]
+type Group = Vec<(&'static Site, Vec<u8>)>;
 
 /// Applies what the switches ask for; a line each in the log and on
 /// standard output.
@@ -291,38 +324,48 @@ pub unsafe fn write(base: usize, size: usize, site: &Site, code: &[u8]) -> Patch
 /// code yet.
 #[cfg(windows)]
 pub unsafe fn apply_asked(base: usize, size: usize) {
-    let mut asked: Vec<(&Site, Vec<u8>, String)> = Vec::new();
+    // Sites that only make sense together go in one group, written all or
+    // none: a smaller output with the pool check left in stops the title,
+    // and the check gone without a smaller output is pointless.
+    let mut asked: Vec<(Group, String)> = Vec::new();
     if let Some((w, h)) = asked_output() {
-        asked.push((&OUTPUT, output_code(w, h), format!("{w}x{h}")));
+        let mut group = vec![(&OUTPUT, output_code(w, h))];
         if (w, h) != (3840, 2160) {
-            asked.push((&POOL_CHECK, pool_check_code(), format!("{w}x{h}")));
+            group.push((&POOL_CHECK, pool_check_code()));
         }
+        asked.push((group, format!("{w}x{h}")));
     }
     if let Some(s) = asked_render_scale() {
-        asked.push((&OWN_SCALE, own_scale_code(s), format!("{s}")));
+        asked.push((vec![(&OWN_SCALE, own_scale_code(s))], format!("{s}")));
     }
     if let Some(kind) = asked_upscaler() {
-        asked.push((&PICKER, picker_code(kind), format!("returns {kind}")));
+        asked.push((
+            vec![(&PICKER, picker_code(kind))],
+            format!("returns {kind}"),
+        ));
     }
-    for (site, code, value) in asked {
+    for (group, value) in asked {
+        let parts: Vec<(&Site, &[u8])> = group.iter().map(|(s, c)| (*s, c.as_slice())).collect();
         // SAFETY: the caller's promise.
-        let done = unsafe { write(base, size, site, &code) };
-        let offset = format!("{:#x}", site.at);
-        match done {
-            Patched::Done => {
-                tracing::info!(site = %offset, what = site.what, value, "resolution: patched")
+        let done = unsafe { write_together(base, size, &parts) };
+        for (site, _) in &parts {
+            let offset = format!("{:#x}", site.at);
+            match done {
+                Patched::Done => {
+                    tracing::info!(site = %offset, what = site.what, value, "resolution: patched")
+                }
+                Patched::Differs => {
+                    tracing::warn!(site = %offset, what = site.what, "resolution: not patched, the title's bytes at one of the sites written together are not the ones expected (another build?)")
+                }
+                Patched::Failed(why) => {
+                    tracing::warn!(site = %offset, what = site.what, why, "resolution: not patched")
+                }
             }
-            Patched::Differs => {
-                tracing::warn!(site = %offset, what = site.what, "resolution: not patched, the title's bytes there are not the ones expected (another build?)")
-            }
-            Patched::Failed(why) => {
-                tracing::warn!(site = %offset, what = site.what, why, "resolution: not patched")
-            }
+            println!(
+                "resolution: {} ({value}) at title+{offset}: {done:?}",
+                site.what
+            );
         }
-        println!(
-            "resolution: {} ({value}) at title+{offset}: {done:?}",
-            site.what
-        );
     }
 }
 
@@ -457,6 +500,85 @@ mod tests {
                 write(place as usize, 0x1000, &far, &own_scale_code(0.5)),
                 Patched::Failed(_)
             ));
+            // Written together: the second site's bytes differ, so the
+            // first one is left as it was too.
+            let first = Site {
+                at: 0x200,
+                what: "test",
+                bytes: OWN_SCALE.bytes,
+            };
+            let second = Site {
+                at: 0x300,
+                what: "test",
+                bytes: POOL_CHECK.bytes,
+            };
+            let mut old = 0;
+            windows_sys::Win32::System::Memory::VirtualProtect(
+                place.cast(),
+                0x1000,
+                0x40,
+                &mut old,
+            );
+            std::ptr::copy_nonoverlapping(
+                first.bytes.as_ptr(),
+                place.add(0x200),
+                first.bytes.len(),
+            );
+            std::ptr::write_bytes(place.add(0x300), 0x90, second.bytes.len());
+            windows_sys::Win32::System::Memory::VirtualProtect(
+                place.cast(),
+                0x1000,
+                PAGE_EXECUTE_READ,
+                &mut old,
+            );
+            let scale = own_scale_code(0.5);
+            let check = pool_check_code();
+            assert_eq!(
+                write_together(
+                    place as usize,
+                    0x1000,
+                    &[(&first, &scale), (&second, &check)]
+                ),
+                Patched::Differs
+            );
+            assert_eq!(
+                std::slice::from_raw_parts(place.add(0x200), first.bytes.len()),
+                first.bytes
+            );
+            // With both as expected, both are written.
+            windows_sys::Win32::System::Memory::VirtualProtect(
+                place.cast(),
+                0x1000,
+                0x40,
+                &mut old,
+            );
+            std::ptr::copy_nonoverlapping(
+                second.bytes.as_ptr(),
+                place.add(0x300),
+                second.bytes.len(),
+            );
+            windows_sys::Win32::System::Memory::VirtualProtect(
+                place.cast(),
+                0x1000,
+                PAGE_EXECUTE_READ,
+                &mut old,
+            );
+            assert_eq!(
+                write_together(
+                    place as usize,
+                    0x1000,
+                    &[(&first, &scale), (&second, &check)]
+                ),
+                Patched::Done
+            );
+            assert_eq!(
+                std::slice::from_raw_parts(place.add(0x200), scale.len()),
+                scale.as_slice()
+            );
+            assert_eq!(
+                std::slice::from_raw_parts(place.add(0x300), check.len()),
+                check.as_slice()
+            );
             VirtualFree(place.cast(), 0, MEM_RELEASE);
         }
     }
