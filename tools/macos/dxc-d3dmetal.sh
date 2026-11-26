@@ -1,3 +1,14 @@
+#!/bin/sh
+# Builds dxc-d3dmetal, a minimal DXC front end over the libdxcompiler.dylib
+# that D3DMetal ships, for VICTORY_HELPER_DXC (see docs/macos.md):
+#   tools/macos/dxc-d3dmetal.sh OUTPUT
+# The source is kept here because the repository's asset policy allows shell
+# scripts but not C++ files. The library is x86_64 only, so this builds for
+# x86_64 and the helper runs under Rosetta.
+set -e
+out="$1"
+[ -n "$out" ] || { echo "usage: $0 OUTPUT" >&2; exit 2; }
+/usr/bin/clang++ -arch x86_64 -std=c++17 -O2 -x c++ -o "$out" - <<'CPP'
 // A minimal DXC front end over the libdxcompiler.dylib that D3DMetal ships,
 // for `VICTORY_HELPER_DXC`: `dxc-d3dmetal -T PROFILE -E ENTRY -Fo OUTPUT
 // INPUT`, the form crates/victory-gpu/build.rs uses. The library is x86_64
@@ -137,3 +148,4 @@ int main(int argc, char **argv) {
     fclose(out);
     return 0;
 }
+CPP

@@ -23,9 +23,8 @@ WINE="${WINE:-$HOME/Library/Caches/victory-macos/target/wine-cx/bin/wine}"
 DXC_LIB="$(dirname "$WINE")/../lib/external/D3DMetal.framework/Versions/A/Resources/libdxcompiler.dylib"
 if [ -z "${VICTORY_HELPER_DXC:-}" ] && [ -f "$DXC_LIB" ]; then
     helper="$HOME/Library/Caches/victory-macos/target/dxc-d3dmetal"
-    if [ ! -x "$helper" ] || [ tools/macos/dxc-d3dmetal.cpp -nt "$helper" ]; then
-        /usr/bin/clang++ -arch x86_64 -std=c++17 -O2 -o "$helper" tools/macos/dxc-d3dmetal.cpp ||
-            helper=
+    if [ ! -x "$helper" ] || [ tools/macos/dxc-d3dmetal.sh -nt "$helper" ]; then
+        sh tools/macos/dxc-d3dmetal.sh "$helper" || helper=
     fi
     if [ -n "$helper" ]; then
         export DXC_LIB VICTORY_HELPER_DXC="$helper"
