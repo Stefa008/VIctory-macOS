@@ -61,6 +61,9 @@ pub mod queue;
 // Plain std, so its tests run everywhere.
 #[cfg(any(windows, test))]
 mod ranges;
+// Plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod recent;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
@@ -89,6 +92,8 @@ mod inplace_probe;
 pub use copystat::CountingAlloc;
 #[cfg(windows)]
 pub use alias::{alias_region, enabled as alias_buffers, unalias_region};
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use alias::{PhysicalHeap, physical_heap};
 #[cfg(windows)]
 pub use host::{MeshSupport, host_mesh_support, on_failure};
 #[cfg(windows)]
@@ -119,18 +124,8 @@ pub fn read_file(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
     }
 }
 
-/// Makes folder `dir` and its parents unless it is there. Not
-/// `std::fs::create_dir_all` alone, which on a folder that is there asks for
-/// its metadata (`Path::is_dir`): the same mount manager call as in
-/// [`read_file`]. The pipeline library makes its folder at every save, on
-/// the pipeline workers.
-pub fn make_dir(dir: &std::path::Path) -> std::io::Result<()> {
-    match std::fs::create_dir(dir) {
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir_all(dir),
-        made => made,
-    }
-}
+#[cfg(windows)]
+pub use victory_pipeline::make_dir;
 
 #[cfg(test)]
 mod read_file_tests {

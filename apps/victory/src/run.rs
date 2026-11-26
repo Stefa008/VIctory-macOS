@@ -156,6 +156,15 @@ pub fn run(
             None => println!("hang watchdog  left on: unknown build"),
         }
     }
+    // The title's output size, render scale and upscaler (`VICTORY_OUTPUT`,
+    // `VICTORY_RENDER_SCALE`, `VICTORY_UPSCALER`; each
+    // off without it), ported from avatarmanz/VIctory-7900XTX.
+    #[cfg(windows)]
+    if execute {
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped and nothing of it has run yet.
+        unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
+    }
     // Masked stores redone as plain stores Rosetta can resume, so fault
     // tracking (`VICTORY_FAULT_TRACKING=1`) can run under Rosetta (#50).
     if let (Some(which), Some(original)) = (patching, original) {
@@ -163,6 +172,16 @@ pub fn run(
         let n =
             victory_loader::masked::patch(image.base() as u64, image.info(), &original, &wanted);
         println!("masked stores  {n} patched to plain stores");
+    }
+    // Every other 256-bit store of the title split into 128-bit halves, from
+    // a list made offline (`cargo xtask wide-stores`): Rosetta cannot resume
+    // one that faults in its second page.
+    #[cfg(windows)]
+    if let Some(list) = std::env::var_os("VICTORY_PATCH_WIDE").filter(|v| !v.is_empty() && v != "0")
+    {
+        let (n, refused) =
+            victory_loader::wide::patch(image.base() as u64, std::path::Path::new(&list));
+        println!("wide stores    {n} split into 128-bit halves ({refused} refused)");
     }
     let resolver = HleResolver::new(if strict {
         HostPolicy::none()

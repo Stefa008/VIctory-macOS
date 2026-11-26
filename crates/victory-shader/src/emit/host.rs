@@ -78,6 +78,7 @@ impl Host {
     /// store through it. D3DMetal advertises RGB32 support but aborts when the
     /// view is created, so those formats are skipped on the hardware adapter
     /// under Wine; WARP is still queried normally.
+    #[cfg(test)]
     pub fn typed_buffer_access(&self, format: DXGI_FORMAT, warp: bool) -> bool {
         if !warp && under_wine()
             && matches!(format, DXGI_FORMAT_R32G32B32_FLOAT | DXGI_FORMAT_R32G32B32_UINT | DXGI_FORMAT_R32G32B32_SINT)
@@ -260,6 +261,7 @@ impl Host {
     /// Every hardware adapter (as [`hardware_adapter`] tells them) whose
     /// device takes SM 6.6, by name: tests that compare GPUs of different
     /// wave widths run on each.
+    #[cfg(test)]
     pub fn each_hardware() -> Vec<(String, Self)> {
         let mut hosts = Vec::new();
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
@@ -294,6 +296,7 @@ impl Host {
     }
 
     /// `device`, if it takes SM 6.6.
+    #[cfg(test)]
     fn sm66(device: ID3D12Device) -> Result<Self, String> {
         let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
             HighestShaderModel: D3D_SHADER_MODEL_6_6,
@@ -953,6 +956,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        root_srv_bytes: lowered.root_srv_bytes,
         memory: lowered.memory,
         memory_writes: lowered.memory_writes,
         view_addresses: lowered.view_addresses,
@@ -1052,6 +1056,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
         root_uavs: Vec::new(),
+        root_srv_bytes: Vec::new(),
         memory: false,
         memory_writes: false,
         view_addresses: false,

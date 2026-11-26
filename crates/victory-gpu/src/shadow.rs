@@ -223,40 +223,34 @@ impl Widened {
 type Snapshot = (Vec<(usize, Vec<u8>)>, std::collections::HashSet<usize>);
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
-static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+static POOL: Mutex<crate::recent::Pool> = Mutex::new(crate::recent::Pool::new());
 
 /// An empty buffer with room for `n` bytes, from the pool if it has one.
 fn pooled(n: usize) -> Vec<u8> {
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let fit = pool
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| v.capacity() >= n)
-        .min_by_key(|(_, v)| v.capacity())
-        .map(|(i, _)| i);
-    let mut v = match fit {
-        Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
-    };
-    v.clear();
-    v
+    let taken = POOL.lock().unwrap_or_else(|e| e.into_inner()).take(n);
+    taken.unwrap_or_else(|| Vec::with_capacity(n))
 }
 
 /// Returns a snapshot buffer to the pool, which keeps the largest up to
 /// [`POOL_BYTES`] in all: a world submission snapshots several copies, and
 /// fresh buffers cost a page fault per 4 KiB touched (millions per frame).
+/// What no snapshot used for a while goes at the present ([`trim_pool`]).
 fn give_back(v: Vec<u8>) {
+    let now = std::time::Instant::now();
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    pool.push(v);
-    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    let mut total = 0;
-    pool.retain(|v| {
-        total += v.capacity();
-        total <= POOL_BYTES
-    });
+    pool.give(v, now, POOL_BYTES);
 }
 
-/// Snapshot memory kept for reuse.
+/// At each present: frees the largest pooled buffer no snapshot took lately
+/// (the peak of a heavy frame, which `pooled` never picks again once lighter
+/// frames fit smaller ones), outside the pool's lock.
+pub(crate) fn trim_pool() {
+    let now = std::time::Instant::now();
+    let freed = POOL.lock().unwrap_or_else(|e| e.into_inner()).trim(now);
+    drop(freed);
+}
+
+/// Snapshot memory kept for reuse at most.
 const POOL_BYTES: usize = 512 << 20;
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
@@ -1299,6 +1293,31 @@ pub(crate) fn forget_read(slot: u32) {
 // shortcut: marks do not tell lists apart: a page that a withheld list and
 // another both wrote through views goes back unless the withheld list
 // declared it.
+pub(crate) const PARALLEL_REFRESH_MIN_BYTES: usize = 512 << 10;
+pub(crate) const PARALLEL_COPY_BACK_MIN_BYTES: usize = 64 << 10;
+
+fn parallel_copies_enabled_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("0"))
+}
+
+pub(crate) fn parallel_copies_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| parallel_copies_enabled_value(std::env::var_os("VICTORY_PARALLEL_COPIES").as_deref()))
+}
+
+/// Whether `(start, len)` ranges are pairwise disjoint.
+pub(crate) fn ranges_disjoint(ranges: &[(u64, u64)]) -> bool {
+    if ranges.len() < 2 {
+        return true;
+    }
+    let mut spans: Vec<(u64, u64)> = ranges
+        .iter()
+        .map(|&(start, len)| (start, start.saturating_add(len)))
+        .collect();
+    spans.sort_unstable();
+    spans.windows(2).all(|w| w[0].1 <= w[1].0)
+}
+
 pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_withheld: bool) {
     let (mut marked, mut held) = (Vec::new(), Vec::new());
     for memory in [false, true] {
@@ -1362,9 +1381,37 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
             None => by_copy.push((copy, vec![page])),
         }
     }
-    for (copy, mut list) in by_copy {
+    for (_, list) in &mut by_copy {
         list.sort_unstable();
         list.dedup();
+    }
+    let total_bytes: usize = by_copy.iter().map(|(_, list)| list.len() * PAGE).sum();
+    let shadow_ranges: Vec<(u64, u64)> = by_copy.iter().map(|(copy, _)| copy.range()).collect();
+    if parallel_copies_enabled()
+        && by_copy.len() >= 2
+        && total_bytes >= PARALLEL_COPY_BACK_MIN_BYTES
+        && ranges_disjoint(&shadow_ranges)
+    {
+        let total_pages: usize = by_copy.iter().map(|(_, list)| list.len()).sum();
+        let total_written = std::sync::atomic::AtomicUsize::new(0);
+        crate::texture::in_parallel(by_copy.len(), |i| {
+            let (copy, list) = &by_copy[i];
+            let written = copy.copy_back_marked(list);
+            total_written.fetch_add(written, Ordering::Relaxed);
+        });
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::copystat::add(crate::copystat::C::MarkedPages, total_pages as u64);
+            crate::copystat::add(
+                crate::copystat::C::MarkedBytes,
+                total_written.into_inner() as u64,
+            );
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = (total_pages, total_written);
+        return;
+    }
+    for (copy, list) in by_copy {
         let written = copy.copy_back_marked(&list);
         #[cfg(feature = "diagnostics")]
         {
@@ -3164,5 +3211,20 @@ pub(crate) mod tests {
         }
         unregister(inner_id, base + 0x1000);
         unregister(outer_id, base);
+    }
+
+    #[test]
+    fn parallel_copies_switch_defaults_on_and_disables_with_zero() {
+        use std::ffi::OsStr;
+        assert!(parallel_copies_enabled_value(None));
+        assert!(parallel_copies_enabled_value(Some(OsStr::new("1"))));
+        assert!(!parallel_copies_enabled_value(Some(OsStr::new("0"))));
+    }
+
+    #[test]
+    fn ranges_disjoint_detects_overlap_and_allows_adjacent() {
+        assert!(ranges_disjoint(&[(0x1000, 0x1000), (0x2000, 0x1000)]));
+        assert!(ranges_disjoint(&[(0x2000, 0x1000), (0x1000, 0x1000)]));
+        assert!(!ranges_disjoint(&[(0x1000, 0x1500), (0x2000, 0x1000)]));
     }
 }

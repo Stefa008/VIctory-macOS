@@ -24,10 +24,12 @@
 #[cfg(windows)]
 mod crash;
 pub mod masked;
+pub mod wide;
 #[cfg(windows)]
 mod patch;
 pub mod prepare;
 pub(crate) mod publish;
+pub mod resolution;
 pub mod resolve;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod stacks;
@@ -52,7 +54,7 @@ pub use patch::patch_code;
 pub use prepare::{PrepareError, PreparedImage, prepare};
 pub use resolve::{ImportResolver, Provenance, Resolution};
 #[cfg(all(windows, feature = "diagnostics"))]
-pub use stacks::{dump_stacks, dump_stacks_on_schedule};
+pub use stacks::dump_stacks_on_schedule;
 #[cfg(windows)]
 pub use threads::{disable_thread_calls, in_title_image};
 #[cfg(windows)]
