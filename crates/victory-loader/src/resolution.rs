@@ -582,4 +582,99 @@ mod tests {
             VirtualFree(place.cast(), 0, MEM_RELEASE);
         }
     }
+
+    /// Windows refuses to make the second site writable (a read-only view
+    /// of a section): `write_together` reports it, and both sites keep
+    /// their bytes and protection. evan-kolberg's way of making the refusal
+    /// happen under Wine (#278).
+    #[cfg(windows)]
+    #[test]
+    fn a_refused_site_leaves_the_group_as_it_was() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MEM_COMMIT, MEM_RELEASE,
+            MEM_RESERVE, MEMORY_BASIC_INFORMATION, MapViewOfFile, PAGE_READONLY, PAGE_READWRITE,
+            UnmapViewOfFile, VirtualAlloc, VirtualFree, VirtualProtect, VirtualQuery,
+        };
+        let protection = |at: usize| {
+            // SAFETY: plain data.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the given size.
+            let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+            assert_ne!(n, 0);
+            info.Protect
+        };
+        // SAFETY: memory of our own, released at the end.
+        unsafe {
+            // The first site: a private page, read-only as the image's code.
+            let first = VirtualAlloc(
+                std::ptr::null(),
+                0x1000,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            ) as *mut u8;
+            assert!(!first.is_null());
+            std::ptr::copy_nonoverlapping(OWN_SCALE.bytes.as_ptr(), first, OWN_SCALE.bytes.len());
+            let mut old = 0;
+            assert_ne!(
+                VirtualProtect(first.cast(), 0x1000, PAGE_READONLY, &mut old),
+                0
+            );
+            // The second: a section seeded through a writable view, then seen
+            // through a read-only one, which cannot be made writable.
+            let section = CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                0x1000,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let writer = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 0x1000);
+            assert!(!writer.Value.is_null());
+            std::ptr::copy_nonoverlapping(
+                POOL_CHECK.bytes.as_ptr(),
+                writer.Value.cast::<u8>(),
+                POOL_CHECK.bytes.len(),
+            );
+            UnmapViewOfFile(writer);
+            let reader = MapViewOfFile(section, FILE_MAP_READ, 0, 0, 0x1000);
+            let second = reader.Value as *mut u8;
+            assert!(!second.is_null());
+
+            // One "image" from the lower of the two to past the higher.
+            let base = (first as usize).min(second as usize);
+            let size = (first as usize).max(second as usize) + 0x1000 - base;
+            let a = Site {
+                at: first as usize - base,
+                what: "test",
+                bytes: OWN_SCALE.bytes,
+            };
+            let b = Site {
+                at: second as usize - base,
+                what: "test",
+                bytes: POOL_CHECK.bytes,
+            };
+            let (scale, check) = (own_scale_code(0.5), pool_check_code());
+            assert!(matches!(
+                write_together(base, size, &[(&a, &scale), (&b, &check)]),
+                Patched::Failed(_)
+            ));
+            assert_eq!(
+                std::slice::from_raw_parts(first, OWN_SCALE.bytes.len()),
+                OWN_SCALE.bytes
+            );
+            assert_eq!(
+                std::slice::from_raw_parts(second, POOL_CHECK.bytes.len()),
+                POOL_CHECK.bytes
+            );
+            assert_eq!(protection(first as usize), PAGE_READONLY);
+            assert_eq!(protection(second as usize), PAGE_READONLY);
+
+            UnmapViewOfFile(reader);
+            CloseHandle(section);
+            VirtualFree(first.cast(), 0, MEM_RELEASE);
+        }
+    }
 }
