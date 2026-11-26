@@ -1673,7 +1673,82 @@ pub(crate) fn evict_unused() {
         let used = used - crate::placement::free_bytes() as f64 / 1e6;
         if used > BUDGET_HIGH * budget { ((used - BUDGET_LOW * budget) * 1e6) as u64 } else { 0 }
     });
-    evict(frame, now_ms(), over);
+    evict(frame, now_ms(), over.max(ram_over()));
+}
+
+/// Where the card's memory is the computer's own (unified: Apple silicon
+/// under D3DMetal, integrated GPUs), host textures also go while less than
+/// [`RAM_LOW`] of the computer's memory is free, until [`RAM_FREE`] would
+/// be. The card's budget leaves out what the title and the host copies of
+/// title memory take of that same memory: on a Mac with 16 GB the budget
+/// was 12.7 GB, host copies took 5.7 GB, and the system swapped long before
+/// the card's use reached it; each guard's `VirtualProtect` then took about
+/// 2.3 ms instead of 10-60 us, 7-11 s a frame (a clean process under the
+/// same Wine: 2-5 us).
+#[cfg(windows)]
+const RAM_LOW: f64 = 0.10;
+#[cfg(windows)]
+const RAM_FREE: f64 = 0.15;
+
+/// The bytes [`evict_unused`] gives up for the computer's free memory
+/// ([`RAM_LOW`]): none unless the card's memory is unified.
+#[cfg(windows)]
+fn ram_over() -> u64 {
+    if !unified() {
+        return 0;
+    }
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: plain data, its length set as the call asks.
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: a valid out pointer.
+    if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+        return 0;
+    }
+    ram_excess(m.ullAvailPhys, m.ullTotalPhys)
+}
+
+/// With `available` of `total` bytes free: what to give up so that
+/// [`RAM_FREE`] is, once less than [`RAM_LOW`] is.
+#[cfg(windows)]
+fn ram_excess(available: u64, total: u64) -> u64 {
+    let total = total as f64;
+    if (available as f64) < RAM_LOW * total {
+        (RAM_FREE * total) as u64 - available
+    } else {
+        0
+    }
+}
+
+/// Whether the host card's memory is the computer's own (its architecture's
+/// UMA), logged once.
+#[cfg(windows)]
+fn unified() -> bool {
+    static UNIFIED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *UNIFIED.get_or_init(|| {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_FEATURE_ARCHITECTURE, D3D12_FEATURE_DATA_ARCHITECTURE,
+        };
+        let Some(host) = crate::host::host() else {
+            return false;
+        };
+        let mut a = D3D12_FEATURE_DATA_ARCHITECTURE::default();
+        // SAFETY: the query writes its own structure of the given size.
+        let ok = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_ARCHITECTURE,
+                (&raw mut a).cast(),
+                size_of_val(&a) as u32,
+            )
+        }
+        .is_ok();
+        let unified = ok && a.UMA.as_bool();
+        tracing::info!(
+            unified,
+            "host card memory unified with the computer's: host textures also kept under its free memory"
+        );
+        unified
+    })
 }
 
 /// The card's budget in MB that [`evict_unused`] keeps host textures under:
@@ -2591,6 +2666,25 @@ mod tests {
             assert!(made.iter().all(|m| m[k] == made[0][k]), "one resource for memory {k}");
             assert!(made_copy(made[0][k] as This).is_some(), "with a host texture");
         }
+    }
+
+    /// Below [`RAM_LOW`] of the computer's memory free, what is given up
+    /// brings it back to [`RAM_FREE`].
+    #[cfg(windows)]
+    #[test]
+    fn free_memory_below_its_share_gives_up_up_to_the_higher_share() {
+        let gb = 1u64 << 30;
+        assert_eq!(ram_excess(4 * gb, 16 * gb), 0);
+        assert_eq!(
+            ram_excess(16 * gb / 10 + 1, 16 * gb),
+            0,
+            "just above the line"
+        );
+        assert_eq!(
+            ram_excess(gb, 16 * gb),
+            (0.15 * (16 * gb) as f64) as u64 - gb
+        );
+        assert_eq!(ram_excess(0, 8 * gb), (0.15 * (8 * gb) as f64) as u64);
     }
 
     /// Textures idle for the idle time and frames are given up; past the
