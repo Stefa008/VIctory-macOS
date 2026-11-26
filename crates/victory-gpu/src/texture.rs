@@ -57,6 +57,10 @@ pub(crate) struct Staging {
     /// The memory's pages changed since detiled (none: not the runtime's
     /// memory, compared instead).
     tracked: Option<crate::watch::Tracked>,
+    /// True once real readable title memory has been uploaded at least once.
+    uploaded_once: std::sync::atomic::AtomicBool,
+    /// Last `crate::queue::presented()` frame on which an untracked check ran.
+    checked_frame: std::sync::atomic::AtomicU64,
     /// Per subresource, the bytes of the texture's memory it lies in (from
     /// its start, whole layout blocks); empty where the layout gives none.
     spans: Vec<(usize, usize)>,
@@ -138,12 +142,20 @@ static BUFFERS: Mutex<Buffers> = Mutex::new(Buffers {
 const KEPT_BYTES: u64 = 64 << 20;
 
 /// Called before a submission's uploads: the buffers of the last one are
-/// free again (the oldest dropped past `KEPT_BYTES`).
+/// free again (the oldest dropped past `KEPT_BYTES`), and so are its chunks,
+/// of which the pool keeps what any submission needed lately, at most
+/// `CHUNKS_KEPT` (a peak of 16 held 512 MB for good). Dropping a chunk
+/// from the pool frees it only when the lists using it are done: each keeps
+/// its own reference (`record_upload`).
 pub(crate) fn recycle() {
     {
+        let now = std::time::Instant::now();
         let mut c = CHUNKS.lock().unwrap_or_else(|e| e.into_inner());
+        let c = &mut *c;
+        let needed = c.current + usize::from(c.used > 0);
+        let kept = c.lately.begin(now, needed).min(CHUNKS_KEPT);
         (c.current, c.used) = (0, 0);
-        c.all.truncate(CHUNKS_KEPT);
+        c.all.truncate(kept);
     }
     let mut b = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
     let b = &mut *b;
@@ -193,15 +205,23 @@ struct Chunks {
     /// The chunk being carved and the bytes taken from it.
     current: usize,
     used: u64,
+    /// The chunks submissions needed lately.
+    lately: crate::recent::Peak,
 }
 
 // SAFETY: the mappings are persistent mappings of the upload buffers.
 unsafe impl Send for Chunks {}
 
-static CHUNKS: Mutex<Chunks> = Mutex::new(Chunks { all: Vec::new(), current: 0, used: 0 });
+static CHUNKS: Mutex<Chunks> = Mutex::new(Chunks {
+    all: Vec::new(),
+    current: 0,
+    used: 0,
+    lately: crate::recent::Peak::new(),
+});
 
 const CHUNK: u64 = 32 << 20;
-/// Chunks kept between submissions (more are made while one needs them).
+/// Chunks kept between submissions at most (more are made while one needs
+/// them).
 const CHUNKS_KEPT: usize = 16;
 
 /// `size` bytes of staging space: a buffer, the offset of the space in it
@@ -415,7 +435,7 @@ pub(crate) fn record_upload(
         // SAFETY: an open list; the barrier names a live texture.
         unsafe { list.list.ResourceBarrier(&[b]) };
     }
-    copies(list, &copy.texture, staging, (buffer, *at), subresources, String::new);
+    copies(list, &copy.texture, staging, (buffer, *at), subresources);
     list.keep(buffer);
     staging.uploads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     staging.copied.fetch_add(subresources.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -440,16 +460,13 @@ pub(crate) fn copied(resource: This) -> u64 {
 
 
 /// Records the copy of `subresources` of `buffer` (laid out as `staging`
-/// says) into `texture` (in the copy destination state); `name` names it
-/// in diagnostics notes.
-#[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+/// says) into `texture` (in the copy destination state).
 fn copies(
     list: &HostList,
     texture: &ID3D12Resource,
     staging: &Staging,
     (buffer, at): (&ID3D12Resource, u64),
     subresources: &[u32],
-    name: impl Fn() -> String,
 ) {
     for &i in subresources {
         let i = i as usize;
@@ -465,8 +482,7 @@ fn copies(
             list.note_read(
                 || {
                     format!(
-                        "texture upload {} ({}x{}x{} f{} mips {}) sub {i} of {} from staging {gpu:#x}+{:#x}: offset {:#x} {}x{}x{} pitch {}",
-                        name(),
+                        "texture upload ({}x{}x{} f{} mips {}) sub {i} of {} from staging {gpu:#x}+{:#x}: offset {:#x} {}x{}x{} pitch {}",
                         d.Width,
                         d.Height,
                         d.DepthOrArraySize,
@@ -590,6 +606,16 @@ impl Staging {
     /// Returns the bytes of title memory read, and the buffer it detiled
     /// into with the subresources detiled.
     fn refresh_now(&self) -> (usize, Option<Upload>) {
+        if self.tracked.is_none()
+            && once_per_frame()
+            && skip_same_frame(
+                &self.uploaded_once,
+                &self.checked_frame,
+                crate::queue::presented(),
+            )
+        {
+            return (0, None);
+        }
         let all = || (0..self.footprints.len() as u32).collect::<Vec<_>>();
         let size = self.layout.size as usize;
         let start = self.memory as usize;
@@ -738,6 +764,10 @@ impl Staging {
             .map(|i| i as u32)
             .collect();
         let buffer = if fresh.is_empty() { None } else { self.detile(&last.read, &fresh) };
+        if buffer.is_some() {
+            self.uploaded_once
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         last.uploaded = last.uploaded || buffer.is_some();
         if buffer.is_none() {
             // Read again (and detiled) at the next refresh.
@@ -1062,6 +1092,8 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
         mips: u32::from(d.MipLevels),
         memory,
         tracked: crate::watch::track(memory as usize, layout_size, true),
+        uploaded_once: std::sync::atomic::AtomicBool::new(false),
+        checked_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
         spans,
         last: Mutex::default(),
         uploads: Default::default(),
@@ -1069,6 +1101,25 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
     });
     *held = Some(s.clone());
     Some(s)
+}
+
+/// Opt-in (`VICTORY_TEXTURE_ONCE_PER_FRAME=1`): check already-uploaded
+/// untracked textures at most once per presented frame instead of on every
+/// command-list submission (~35x/frame in GTA VI under Rosetta/Wine where
+/// watch tracking is off). Newly created or not-yet-readable textures are
+/// still checked on every submission until their first real upload lands.
+fn once_per_frame() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_TEXTURE_ONCE_PER_FRAME"))
+}
+
+fn skip_same_frame(
+    uploaded_once: &std::sync::atomic::AtomicBool,
+    checked_frame: &std::sync::atomic::AtomicU64,
+    frame: u64,
+) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    uploaded_once.load(Relaxed) && checked_frame.swap(frame, Relaxed) == frame
 }
 
 #[cfg(test)]
@@ -1377,5 +1428,23 @@ mod tests {
         assert!(committed(rw.cast::<u8>(), 4096));
         // SAFETY: freeing the allocation above.
         unsafe { VirtualFree(rw, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn once_per_frame_skips_repeat_checks_only_after_first_upload() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+        let uploaded = AtomicBool::new(false);
+        let checked = AtomicU64::new(u64::MAX);
+        // Before the first real upload, every submission checks.
+        assert!(!skip_same_frame(&uploaded, &checked, 10));
+        assert!(!skip_same_frame(&uploaded, &checked, 10));
+        // After the first real upload, check once on frame 10, skip repeats,
+        // and check again once frame advances to 11.
+        uploaded.store(true, Relaxed);
+        assert!(!skip_same_frame(&uploaded, &checked, 10));
+        assert!(skip_same_frame(&uploaded, &checked, 10));
+        assert!(skip_same_frame(&uploaded, &checked, 10));
+        assert!(!skip_same_frame(&uploaded, &checked, 11));
+        assert!(skip_same_frame(&uploaded, &checked, 11));
     }
 }
