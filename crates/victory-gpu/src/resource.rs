@@ -1720,35 +1720,52 @@ fn ram_excess(available: u64, total: u64) -> u64 {
     }
 }
 
-/// Whether the host card's memory is the computer's own (its architecture's
-/// UMA), logged once.
+/// Whether the host card's memory is the computer's own, logged once: its
+/// architecture's UMA, or its local and non-local segments offering one
+/// and the same budget (D3DMetal reports no UMA on Apple silicon, and both
+/// segments as the same 12713 MB on a 16 GB Mac).
 #[cfg(windows)]
 fn unified() -> bool {
     static UNIFIED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *UNIFIED.get_or_init(|| {
-        use windows::Win32::Graphics::Direct3D12::{
-            D3D12_FEATURE_ARCHITECTURE, D3D12_FEATURE_DATA_ARCHITECTURE,
-        };
-        let Some(host) = crate::host::host() else {
-            return false;
-        };
-        let mut a = D3D12_FEATURE_DATA_ARCHITECTURE::default();
-        // SAFETY: the query writes its own structure of the given size.
-        let ok = unsafe {
-            host.device.CheckFeatureSupport(
-                D3D12_FEATURE_ARCHITECTURE,
-                (&raw mut a).cast(),
-                size_of_val(&a) as u32,
-            )
-        }
-        .is_ok();
-        let unified = ok && a.UMA.as_bool();
-        tracing::info!(
-            unified,
-            "host card memory unified with the computer's: host textures also kept under its free memory"
-        );
-        unified
-    })
+    if let Some(&unified) = UNIFIED.get() {
+        return unified;
+    }
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_ARCHITECTURE, D3D12_FEATURE_DATA_ARCHITECTURE,
+    };
+    // Not decided until the adapter answers.
+    let (Some(host), Some([(_, local), (_, other)])) =
+        (crate::host::host(), crate::host::video_memory())
+    else {
+        return false;
+    };
+    let mut a = D3D12_FEATURE_DATA_ARCHITECTURE::default();
+    // SAFETY: the query writes its own structure of the given size.
+    let uma = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_ARCHITECTURE,
+            (&raw mut a).cast(),
+            size_of_val(&a) as u32,
+        )
+    }
+    .is_ok()
+        && a.UMA.as_bool();
+    let unified = *UNIFIED.get_or_init(|| one_memory(uma, local, other));
+    tracing::info!(
+        unified,
+        uma,
+        local_mb = local,
+        non_local_mb = other,
+        "host card memory unified with the computer's: host textures also kept under its free memory"
+    );
+    unified
+}
+
+/// [`unified`]'s rule: the architecture says so, or both segments' budgets
+/// (MB) are one.
+#[cfg(windows)]
+fn one_memory(uma: bool, local: f64, non_local: f64) -> bool {
+    uma || (local > 0.0 && local == non_local)
 }
 
 /// The card's budget in MB that [`evict_unused`] keeps host textures under:
@@ -2666,6 +2683,19 @@ mod tests {
             assert!(made.iter().all(|m| m[k] == made[0][k]), "one resource for memory {k}");
             assert!(made_copy(made[0][k] as This).is_some(), "with a host texture");
         }
+    }
+
+    /// Unified: by the architecture, or by one budget for both segments.
+    #[cfg(windows)]
+    #[test]
+    fn one_budget_for_both_segments_is_one_memory() {
+        assert!(one_memory(true, 8192.0, 16384.0));
+        assert!(
+            one_memory(false, 12713.0, 12713.0),
+            "D3DMetal on a 16 GB Mac"
+        );
+        assert!(!one_memory(false, 8192.0, 16384.0), "a card of its own");
+        assert!(!one_memory(false, 0.0, 0.0));
     }
 
     /// Below [`RAM_LOW`] of the computer's memory free, what is given up
