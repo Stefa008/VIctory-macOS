@@ -1765,12 +1765,17 @@ fn candidates() -> Vec<Owned> {
 /// Of textures last used at (frame, ms) taking (bytes) each, those to give
 /// up at (`frame`, `now`): every one idle for [`IDLE_FRAMES`] and
 /// [`IDLE_MS`], then the least recently used others until `over` bytes are
-/// gone (indices).
+/// gone (indices). Past the budget, none used within the last
+/// [`SOON_FRAMES`] frames goes: those are the frames' own textures, made
+/// again at once (on a 16 GB Mac with `VICTORY_GPU_BUDGET_MB=4096`, 53 % of
+/// the textures given up were made again within [`SOON_FRAMES`], and the
+/// picture flickered), and the card's use stays where it was.
 #[cfg(windows)]
 fn choose(uses: &[(u64, u64, u64)], frame: u64, now: u64, over: u64) -> Vec<usize> {
     let idle = |&(f, ms, _): &(u64, u64, u64)| frame.saturating_sub(f) >= IDLE_FRAMES && now.saturating_sub(ms) >= IDLE_MS;
     let (mut gone, mut rest): (Vec<usize>, Vec<usize>) = (0..uses.len()).partition(|&i| idle(&uses[i]));
     let mut over = over.saturating_sub(gone.iter().map(|&i| uses[i].2).sum());
+    rest.retain(|&i| frame.saturating_sub(uses[i].0) > SOON_FRAMES);
     rest.sort_by_key(|&i| uses[i].1);
     for i in rest {
         if over == 0 {
@@ -2590,19 +2595,30 @@ mod tests {
 
     /// Textures idle for the idle time and frames are given up; past the
     /// budget the least recently used others follow until the excess is
-    /// gone.
+    /// gone, but never one used within the last [`SOON_FRAMES`] frames.
     #[cfg(windows)]
     #[test]
     fn idle_textures_go_and_past_the_budget_the_least_recently_used() {
         let (frame, now) = (1_000, 1_000_000);
         let recent = (frame, now - 1_000, 10);
         let idle = (frame - IDLE_FRAMES, now - IDLE_MS, 10);
-        let older = (frame, now - 5_000, 30);
-        let uses = [recent, idle, older];
+        let older = (frame - SOON_FRAMES - 1, now - 5_000, 30);
+        let oldest = (frame - SOON_FRAMES - 2, now - 6_000, 20);
+        let uses = [recent, idle, older, oldest];
         assert_eq!(choose(&uses, frame, now, 0), vec![1], "idle only");
         assert_eq!(choose(&uses, frame, now, 10), vec![1], "the idle one covers the excess");
-        assert_eq!(choose(&uses, frame, now, 11), vec![1, 2], "then the least recently used");
-        assert_eq!(choose(&uses, frame, now, 1 << 20), vec![1, 2, 0], "all of them if need be");
+        assert_eq!(choose(&uses, frame, now, 11), vec![1, 3], "then the least recently used");
+        assert_eq!(choose(&uses, frame, now, 31), vec![1, 3, 2], "and the next");
+        assert_eq!(
+            choose(&uses, frame, now, 1 << 20),
+            vec![1, 3, 2],
+            "all of them if need be, except those of the last frames"
+        );
+        let just = (frame - SOON_FRAMES, now - 5_000, 30);
+        assert!(
+            choose(&[just], frame, now, 1 << 20).is_empty(),
+            "used within the last frames"
+        );
         let early = (frame - 1, now - IDLE_MS, 10);
         assert!(choose(&[early], frame, now, 0).is_empty(), "too few frames ago");
     }
